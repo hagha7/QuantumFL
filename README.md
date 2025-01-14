@@ -1,1 +1,1 @@
-# FederatedQML
+# Quantum Federated Learning
