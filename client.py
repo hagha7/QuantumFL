@@ -1,21 +1,20 @@
 import torch
 from torch import nn, optim
-from torch.utils.data import DataLoader, random_split
 from torchvision import datasets, transforms
+from torch.utils.data import DataLoader, random_split
 import flwr as fl
-from opacus import PrivacyEngine
 import pennylane as qml
 
+# Quantum and classical model settings
 n_qubits = 4
 encoder_depth = 2
 dev = qml.device("lightning.qubit", wires=n_qubits)
 
-# Define quantum circuit components
+# Define quantum feature map and circuit
 def featureMap(n_qubits):
     for idx in range(n_qubits):
         qml.Hadamard(wires=idx)
-    for idx, element in enumerate(n_qubits):
-        qml.RY(element, wires=idx)
+        qml.RY(0.1 * idx, wires=idx)
 
 def entangling(n_qubits):
     for i in range(0, n_qubits - 1, 2):
@@ -31,11 +30,14 @@ def variationalCircuit(n_qubits, params):
             qml.RX(layer_params[idx, 1], wires=idx)
             qml.RZ(layer_params[idx, 2], wires=idx)
         entangling(n_qubits)
+    # Add a measurement (e.g., expectation value)
+    return [qml.expval(qml.PauliZ(wires=i)) for i in range(n_qubits)]
 
-# Define the ConvNet with Quantum Layer
-class ConvNet(nn.Module):
+
+# Define the hybrid quantum-classical model
+class QuantumConvNet(nn.Module):
     def __init__(self):
-        super(ConvNet, self).__init__()
+        super(QuantumConvNet, self).__init__()
         self.conv1 = nn.Conv2d(1, 32, kernel_size=3)
         self.pool = nn.MaxPool2d(kernel_size=2)
         self.flatten = nn.Flatten()
@@ -49,18 +51,24 @@ class ConvNet(nn.Module):
         x = self.flatten(x)
         x = torch.relu(self.fc1(x))
 
-        # Quantum layer
+        # Define QNode
         def quantum_layer(params):
-            return variationalCircuit(n_qubits, params)
+            return variationalCircuit(n_qubits=n_qubits, params=params)
 
+        # Create the QNode with correct arguments
         qnode = qml.QNode(quantum_layer, dev, interface="torch")
+
+        # Quantum output
         quantum_output = qnode(self.encoder_params)
 
-        x = x + quantum_output.sum()  # Incorporating quantum output
+        quantum_output = torch.tensor(quantum_output, device=x.device)
+
+        # Combine quantum output with classical processing
+        x = x + quantum_output.sum()
         x = torch.softmax(self.fc2(x), dim=1)
         return x
 
-# Load data for this client
+# Load data for the client
 def load_data():
     transform = transforms.Compose([
         transforms.ToTensor(),
@@ -74,107 +82,68 @@ def load_data():
     val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
     return train_loader, val_loader
 
-
-class MnistClient(fl.client.NumPyClient):
+# Define the Flower client
+class QuantumClient(fl.client.NumPyClient):
     def __init__(self, model, train_loader, val_loader):
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(self.device)
 
-    def get_parameters(self, config=None):  # Add config=None
+    def get_parameters(self, config=None):  # Add `config=None` to the method signature
+        print("[Client] Sending model parameters...")
         return [val.cpu().numpy() for _, val in self.model.state_dict().items()]
 
+
     def set_parameters(self, parameters):
+        print("[Client] Receiving and setting model parameters...")
         params_dict = zip(self.model.state_dict().keys(), parameters)
         state_dict = {k: torch.tensor(v) for k, v in params_dict}
         self.model.load_state_dict(state_dict)
 
     def fit(self, parameters, config):
+        print("[Client] Training model...")
         self.set_parameters(parameters)
         self.train(epochs=1)
         return self.get_parameters(), len(self.train_loader.dataset), {}
 
     def evaluate(self, parameters, config):
-        # Set model parameters from server
+        print("[Client] Evaluating model...")
         self.set_parameters(parameters)
-        
-        # Evaluation logic
+        total_loss, correct, num_samples = 0.0, 0, 0
         criterion = nn.CrossEntropyLoss()
-        total_loss = 0
-        correct = 0
         self.model.eval()
         with torch.no_grad():
             for data, target in self.val_loader:
-                data, target = data.to(device), target.to(device)
+                data, target = data.to(self.device), target.to(self.device)
                 output = self.model(data)
-                loss = criterion(output, target)
-                total_loss += loss.item()
+                total_loss += criterion(output, target).item() * data.size(0)
                 pred = output.argmax(dim=1, keepdim=True)
                 correct += pred.eq(target.view_as(pred)).sum().item()
-        
-        # Calculate metrics
-        accuracy = correct / len(self.val_loader.dataset)
-        avg_loss = total_loss / len(self.val_loader)
-        
-        # Return results
-        return avg_loss, len(self.val_loader.dataset), {"accuracy": accuracy}
-
+                num_samples += data.size(0)
+        avg_loss = total_loss / num_samples
+        accuracy = correct / num_samples
+        print(f"[Client] Evaluation results - Loss: {avg_loss}, Accuracy: {accuracy}")
+        return avg_loss, num_samples, {"accuracy": accuracy}
 
     def train(self, epochs):
         criterion = nn.CrossEntropyLoss()
         optimizer = optim.Adam(self.model.parameters(), lr=0.001)
-        privacy_engine = PrivacyEngine(
-            self.model,
-            sample_rate=0.01,  # Adjust based on batch size
-            noise_multiplier=0.5,
-            max_grad_norm=1.0,
-        )
-        privacy_engine.attach(optimizer)
-
         self.model.train()
         for epoch in range(epochs):
             for data, target in self.train_loader:
-                data, target = data.to(device), target.to(device)
+                data, target = data.to(self.device), target.to(self.device)
                 optimizer.zero_grad()
                 output = self.model(data)
                 loss = criterion(output, target)
                 loss.backward()
                 optimizer.step()
 
-        privacy_engine.detach()
-
-    def test(self):
-        criterion = nn.CrossEntropyLoss()
-        correct = 0
-        total_loss = 0
-        self.model.eval()
-        with torch.no_grad():
-            for data, target in self.val_loader:
-                data, target = data.to(device), target.to(device)
-                output = self.model(data)
-                loss = criterion(output, target)
-                total_loss += loss.item()
-                pred = output.argmax(dim=1, keepdim=True)
-                correct += pred.eq(target.view_as(pred)).sum().item()
-        accuracy = correct / len(self.val_loader.dataset)
-        return total_loss / len(self.val_loader), accuracy
-
-
+# Main function to start the client
 if __name__ == "__main__":
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Load data
     train_loader, val_loader = load_data()
-
-    # Initialize model
-    model = ConvNet().to(device)
-
-    # Create a NumPyClient
-    client = MnistClient(model, train_loader, val_loader)
-
-    # Convert the NumPyClient to a Client object and start the Flower client
-    fl.client.start_client(
-        server_address="localhost:8080",
-        client=client.to_client()  # Use .to_client() to convert
-    )
-
+    model = QuantumConvNet()
+    client = QuantumClient(model, train_loader, val_loader)
+    print("[Client] Starting client...")
+    fl.client.start_numpy_client(server_address="localhost:8080", client=client)
