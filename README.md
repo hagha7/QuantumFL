@@ -6,5 +6,4 @@ Features
 - Federated Learning: Distributed training across multiple clients using the Flower framework.
 - Hybrid Models: Incorporates a quantum variational circuit layer within a classical CNN architecture.
 - Quantum Integration: Utilizes PennyLane for quantum circuit simulation on lightning.qubit.
-- Differential Privacy (Optional): Opacus library integration for adding privacy to federated updates.
 - Customizable: Flexible model, dataset, and training configuration for experimentation.
